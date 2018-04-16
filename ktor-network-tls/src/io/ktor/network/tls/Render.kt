@@ -1,36 +1,55 @@
 package io.ktor.network.tls
 
+import io.ktor.network.tls.extensions.*
 import kotlinx.io.core.*
-import kotlinx.io.core.ByteReadPacket
 import java.security.*
 import javax.crypto.*
 import javax.crypto.spec.*
 import kotlin.coroutines.experimental.*
 
-fun BytePacketBuilder.writeTLSHeader(header: TLSRecordHeader) {
-    writeByte(header.type.code.toByte())
-    writeShort(header.version.code.toShort())
-    writeShort(header.length.toShort())
+
+fun makeHandshakeRecord(handshakeType: TLSHandshakeType, block: BytePacketBuilder.() -> Unit): TLSRecord {
+    val handshakeBody = buildPacket(block = block)
+
+    val recordBody = buildPacket {
+        writeTLSHandshakeType(handshakeType, handshakeBody.remaining)
+        writePacket(handshakeBody)
+    }
+
+    return TLSRecord().apply {
+        type = TLSRecordType.Handshake
+        length = recordBody.remaining
+        packet = recordBody
+    }
 }
 
-fun BytePacketBuilder.writeTLSHandshake(handshake: TLSHandshakeHeader) {
-    if (handshake.length > 0xffffff) throw TLSException("TLS handshake size limit exceeded: ${handshake.length}")
-    val v = (handshake.type.code shl 24) or handshake.length
+fun BytePacketBuilder.writeTLSHandshakeType(type: TLSHandshakeType, length: Int) {
+    if (length > 0xffffff) throw TLSException("TLS handshake size limit exceeded: $length")
+    val v = (type.code shl 24) or length
     writeInt(v)
 }
 
-fun BytePacketBuilder.writeTLSClientHello(hello: TLSHandshakeHeader) {
-    writeShort(hello.version.code.toShort())
-    writeFully(hello.random)
+fun BytePacketBuilder.writeTLSClientHello(
+    version: TLSVersion,
+    suites: List<CipherSuite>,
+    random: ByteArray,
+    sessionId: ByteArray,
+    serverName: String? = null
+) {
+    writeShort(version.code.toShort())
+    writeFully(random)
 
-    if (hello.sessionIdLength < 0 || hello.sessionIdLength > 0xff || hello.sessionIdLength > hello.sessionId.size) throw TLSException("Illegal sessionIdLength")
-    writeByte(hello.sessionIdLength.toByte())
-    writeFully(hello.sessionId, 0, hello.sessionIdLength)
+    val sessionIdLength = sessionId.size
+    if (sessionIdLength < 0 || sessionIdLength > 0xff || sessionIdLength > sessionId.size) throw TLSException(
+        "Illegal sessionIdLength"
+    )
 
-    writeShort((hello.suitesCount * 2).toShort())
-    val suites = hello.suites
-    for (i in 0 until hello.suitesCount) {
-        writeShort(suites[i])
+    writeByte(sessionIdLength.toByte())
+    writeFully(sessionId, 0, sessionIdLength)
+
+    writeShort((suites.size * 2).toShort())
+    for (suite in suites) {
+        writeShort(suite.code)
     }
 
     // compression is always null
@@ -39,7 +58,7 @@ fun BytePacketBuilder.writeTLSClientHello(hello: TLSHandshakeHeader) {
 
     val extensions = ArrayList<ByteReadPacket>()
     extensions += buildSignatureAlgorithmsExtension()
-    hello.serverName?.let { name ->
+    serverName?.let { name ->
         extensions += buildServerNameExtension(name)
     }
 
@@ -49,16 +68,18 @@ fun BytePacketBuilder.writeTLSClientHello(hello: TLSHandshakeHeader) {
     }
 }
 
-private fun buildSignatureAlgorithmsExtension(): ByteReadPacket {
-    return buildPacket {
-        writeShort(0x000d) // signature_algorithms
-        val signaturesCount = 3
-        writeShort((2 + signaturesCount * 2).toShort()) // length in bytes
-        writeShort((signaturesCount * 2).toShort()) // length in bytes
+private fun buildSignatureAlgorithmsExtension(
+    algorithms: List<HashAndSign> = SupportedSignatureAlgorithms
+): ByteReadPacket = buildPacket {
+    writeShort(0x000d) // signature_algorithms extension
 
-        writeShort(0x0601) // sha512+RSA
-        writeShort(0x0501) // sha384+RSA
-        writeShort(0x0401) // sha256+RSA
+    val size = algorithms.size
+    writeShort((2 + size * 2).toShort()) // length in bytes
+    writeShort((size * 2).toShort()) // length in bytes
+
+    algorithms.forEach {
+        writeByte(it.hash.code)
+        writeByte(it.sign.code)
     }
 }
 
@@ -73,7 +94,11 @@ private fun buildServerNameExtension(name: String): ByteReadPacket {
     }
 }
 
-fun BytePacketBuilder.writeEncryptedPreMasterSecret(preSecret: ByteArray, publicKey: PublicKey, random: SecureRandom) {
+fun BytePacketBuilder.writeEncryptedPreMasterSecret(
+    preSecret: ByteArray,
+    publicKey: PublicKey,
+    random: SecureRandom
+) {
     require(preSecret.size == 48)
 
     val rsaCipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")!!
@@ -85,20 +110,20 @@ fun BytePacketBuilder.writeEncryptedPreMasterSecret(preSecret: ByteArray, public
     writeShort(encryptedSecret.size.toShort())
     writeFully(encryptedSecret)
 }
-
-fun BytePacketBuilder.writeChangeCipherSpec(header: TLSRecordHeader) {
-    header.type = TLSRecordType.ChangeCipherSpec
-    header.length = 1
-
-    writeTLSHeader(header)
-    writeByte(1)
-}
+//
+//fun BytePacketBuilder.writeChangeCipherSpec(header: TLSRecordHeader) {
+//    header.type = TLSRecordType.ChangeCipherSpec
+//    header.length = 1
+//
+//    writeTLSHeader(header)
+//    writeByte(1)
+//}
 
 internal suspend fun finished(
-        messages: List<ByteReadPacket>,
-        baseHash: String,
-        secretKey: SecretKeySpec,
-        coroutineContext: CoroutineContext
+    messages: List<ByteReadPacket>,
+    baseHash: String,
+    secretKey: SecretKeySpec,
+    coroutineContext: CoroutineContext
 ): ByteReadPacket {
     val digestBytes = hashMessages(messages, baseHash, coroutineContext)
     return finished(digestBytes, secretKey)
@@ -110,4 +135,4 @@ internal fun finished(digest: ByteArray, secretKey: SecretKey) = buildPacket {
 }
 
 internal fun serverFinished(handshakeHash: ByteArray, secretKey: SecretKey, length: Int = 12): ByteArray =
-        PRF(secretKey, SERVER_FINISHED_LABEL, handshakeHash, length)
+    PRF(secretKey, SERVER_FINISHED_LABEL, handshakeHash, length)

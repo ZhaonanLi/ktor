@@ -10,10 +10,10 @@ import java.util.concurrent.*
 
 abstract class TestWithKtor {
     abstract val server: ApplicationEngine
-    protected val serverPort: Int = ServerSocket(0).use { it.localPort }
+    protected val serverPort: Int = 8080// ServerSocket(8080).use { it.localPort }
 
     init {
-        (LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME) as? Logger)?.level = Level.ALL
+        (LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME) as? Logger)?.level = Level.ERROR
     }
 
     @Before
